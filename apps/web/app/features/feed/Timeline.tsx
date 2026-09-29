@@ -39,8 +39,11 @@ function fromResponse(r: TimelineResponse): ListState {
 
 const WEEKDAY_SHORT = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
-/** Sticky day header: a quiet row on desktop, a grey full-width bar on phones. */
-export function DayHeader({ day, today, count, collapsed, onToggle }: { day: string; today: string; count: number | null; collapsed?: boolean; onToggle?: () => void }) {
+/**
+ * Sticky day header: a quiet row on desktop, a grey full-width bar on phones. `aside` (desktop only)
+ * sits at the right end of the row, e.g. 全部动态's sort control on the first day.
+ */
+export function DayHeader({ day, today, count, collapsed, onToggle, aside }: { day: string; today: string; count: number | null; collapsed?: boolean; onToggle?: () => void; aside?: React.ReactNode }) {
   const [, m, d] = day.split("-").map(Number) as [number, number, number];
   const date = `${m}月${d}日`;
   const weekday = beijingWeekday(day);
@@ -71,15 +74,18 @@ export function DayHeader({ day, today, count, collapsed, onToggle }: { day: str
         ) : (
           <span />
         )}
-        <span className="text-[13px] text-ink-4">
-          {weekday}
-          {count !== null && (
-            <>
-              {" · "}
-              <span className="num">{count}</span> 条
-            </>
-          )}
-        </span>
+        <div className="flex min-w-0 items-center justify-between gap-3">
+          <span className="text-[13px] text-ink-4">
+            {weekday}
+            {count !== null && (
+              <>
+                {" · "}
+                <span className="num">{count}</span> 条
+              </>
+            )}
+          </span>
+          {aside}
+        </div>
       </div>
     </div>
   );

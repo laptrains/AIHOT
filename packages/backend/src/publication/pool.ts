@@ -1,5 +1,5 @@
-// Public pool (/all) with numeric pages, and search in its two orderings.
-import type { PoolResponse, TimelineFilters } from "@aihot/contracts/site";
+// Public pool (/all) with numeric pages in time or score order, and search in its three orderings.
+import type { PoolResponse, PoolSort, TimelineFilters } from "@aihot/contracts/site";
 import { beijingDate, beijingMidnight } from "@aihot/contracts/time";
 import { one, sql, withCustomPlans, type Db } from "../db.ts";
 import {
@@ -83,6 +83,17 @@ export function publicMatchCondition(terms: string[]) {
   );
 }
 
+/**
+ * Pool order. "score" keeps the Beijing-day grouping (the list shows one header per day) and ranks
+ * each day by AI score, unscored last; publications_pool_score_idx carries the same keys. article_id
+ * last keeps OFFSET pages stable.
+ */
+export function poolOrder(sort: PoolSort) {
+  return sort === "score"
+    ? sql`(p.timeline_at AT TIME ZONE 'Asia/Shanghai')::date DESC, p.score DESC NULLS LAST, p.timeline_at DESC, p.article_id DESC`
+    : sql`p.timeline_at DESC, p.article_id DESC`;
+}
+
 /** Unfiltered-by-search totals only set the page count; they are reused for 30 seconds per filter. */
 const countCache = new Map<string, { at: number; n: number }>();
 const countPending = new Map<string, Promise<number>>();
@@ -105,6 +116,7 @@ async function poolCount(key: string | null, query: () => Promise<Array<{ n: num
 export interface PoolQuery extends TimelineFilters {
   q?: string | null;
   tab?: "time" | "relevance";
+  sort?: PoolSort;
   page?: number;
   topicTags?: string[] | null;
   now?: Date;
@@ -115,9 +127,10 @@ export async function loadPool(query: PoolQuery): Promise<PoolResponse> {
   const page = Math.min(Math.max(query.page ?? 1, 1), POOL_MAX_PAGES);
   const q = query.q?.trim() || null;
   const tab = q && query.tab === "relevance" ? "relevance" : "time";
+  // A relevance search ranks by match; otherwise score order applies with or without a search.
+  const sort: PoolSort = tab === "time" && query.sort === "score" ? "score" : "time";
   const terms = q ? searchTerms(q) : [];
   const filters = sql`${channelCondition(query.channel)} ${categoryCondition(query.category)} ${tagCondition(query.tag)} ${topicCondition(query.topicTags)}`;
-  const offset = (page - 1) * POOL_PAGE_SIZE;
   const cap = POOL_MAX_PAGES * POOL_PAGE_SIZE;
   // A fixed clock (tests, replays) never shares cached totals.
   const filterKey = query.now ? null : JSON.stringify([query.channel, query.category, query.tag, query.topicTags ?? null]);
@@ -125,15 +138,16 @@ export async function loadPool(query: PoolQuery): Promise<PoolResponse> {
   // Searches go through pool_search (eligible items only): trigram indexes for longer terms, a small
   // table to scan for one- and two-character ones.
   const like = (col: ReturnType<typeof sql>, t: string) => sql`${col} LIKE ${"%" + t + "%"}`;
-  const run = async (db: Db) => {
+  const order = poolOrder(sort);
+  const run = async (db: Db, offset: number) => {
     if (!q) {
-      // Page ids from the timeline index first, then the joins for those rows only.
+      // Page ids from the timeline (or score) index first, then the joins for those rows only.
       const rows = await db<ItemRow[]>`
         WITH page AS (
           SELECT p.article_id FROM publications p WHERE ${listedCondition(now)} AND p.eligible ${filters}
-          ORDER BY p.timeline_at DESC, p.article_id DESC LIMIT ${POOL_PAGE_SIZE} OFFSET ${offset})
+          ORDER BY ${order} LIMIT ${POOL_PAGE_SIZE} OFFSET ${offset})
         SELECT ${ITEM_COLUMNS} ${ITEM_FROM} WHERE p.article_id IN (SELECT article_id FROM page)
-        ORDER BY p.timeline_at DESC, p.article_id DESC`;
+        ORDER BY ${order}`;
       return { rows, total: await poolCount(filterKey, () => db<{ n: number }[]>`
         SELECT count(*) AS n FROM (SELECT 1 FROM publications p WHERE ${listedCondition(now)} AND p.eligible ${filters} LIMIT ${cap}) t`) };
     }
@@ -173,14 +187,15 @@ export async function loadPool(query: PoolQuery): Promise<PoolResponse> {
       const rows = result.filter((r): r is ItemRow & { rel: number; total: number } => r.id !== null);
       return { rows, total: Number(result[0]!.total) };
     }
-    // Default search: newest first straight from the timeline index; the total from the pool's
-    // search rows, where one- and two-character terms scan a small table instead of every item.
+    // Default search (newest first, or by score): the title / summary match, paged in pool order; the
+    // total from the pool's search rows, where one- and two-character terms scan a small table
+    // instead of every item. Both orders match the same rows, so they report the same total.
     const rows = await db<ItemRow[]>`
       WITH page AS (
         SELECT p.article_id FROM publications p WHERE ${listedCondition(now)} AND p.eligible ${filters} ${directMatchCondition(terms)}
-        ORDER BY p.timeline_at DESC, p.article_id DESC LIMIT ${POOL_PAGE_SIZE} OFFSET ${offset})
+        ORDER BY ${order} LIMIT ${POOL_PAGE_SIZE} OFFSET ${offset})
       SELECT ${ITEM_COLUMNS} ${ITEM_FROM} WHERE p.article_id IN (SELECT article_id FROM page)
-      ORDER BY p.timeline_at DESC, p.article_id DESC`;
+      ORDER BY ${order}`;
     const direct = terms.reduce((acc, t) => sql`${acc} AND ${like(sql`ps.direct`, t)}`, sql``);
     const { n } = one(await db<{ n: number }[]>`
       SELECT count(*) AS n FROM (SELECT 1 FROM pool_search ps JOIN publications p ON p.article_id = ps.article_id
@@ -188,7 +203,15 @@ export async function loadPool(query: PoolQuery): Promise<PoolResponse> {
     return { rows, total: Number(n) };
   };
 
-  const { rows, total } = q ? await withSearchCapacity(run) : await run(sql);
+  const pagesOf = (total: number) => Math.min(POOL_MAX_PAGES, Math.max(1, Math.ceil(total / POOL_PAGE_SIZE)));
+  // A page past the end (a changed ordering or filter left an old page number) serves the last page.
+  const runPage = async (db: Db) => {
+    const first = await run(db, (page - 1) * POOL_PAGE_SIZE);
+    const last = pagesOf(first.total);
+    if (first.rows.length > 0 || first.total === 0 || page <= last) return { ...first, page };
+    return { ...(await run(db, (last - 1) * POOL_PAGE_SIZE)), page: last };
+  };
+  const { rows, total, page: served } = q ? await withSearchCapacity(runPage) : await runPage(sql);
   const today = beijingDate(now);
   const meta = one(await sql<{ today_count: number; updated_at: Date | null }[]>`
     SELECT (SELECT count(*) FROM publications p
@@ -196,10 +219,10 @@ export async function loadPool(query: PoolQuery): Promise<PoolResponse> {
       (SELECT max(p.updated_at) FROM publications p WHERE p.eligible) AS updated_at`);
 
   return {
-    filters: { channel: query.channel, category: query.category, tag: query.tag, topic: query.topic ?? null, q, tab },
+    filters: { channel: query.channel, category: query.category, tag: query.tag, topic: query.topic ?? null, q, tab, sort },
     items: rows.map(toFeedItemSummary),
-    page,
-    pageCount: Math.min(POOL_MAX_PAGES, Math.max(1, Math.ceil(total / POOL_PAGE_SIZE))),
+    page: served,
+    pageCount: pagesOf(total),
     total,
     todayCount: Number(meta.today_count),
     freshness: (meta.updated_at ?? now).toISOString(),

@@ -1,12 +1,13 @@
 import { SITE, withSubject } from "@aihot/industry/site";
-import { Link, useLoaderData, useNavigation, useSearchParams } from "react-router";
+import { Link, redirect, useLoaderData, useNavigate, useNavigation, useSearchParams } from "react-router";
 import type { Route } from "./+types/all";
-import type { PoolResponse } from "@aihot/contracts/site";
+import type { PoolResponse, PoolSort } from "@aihot/contracts/site";
 import { isCategoryKey, isChannelKey } from "@aihot/contracts/taxonomy";
 import { loadOr404, queryString } from "../lib/api.server";
 import { listPath, pageMeta } from "../lib/seo";
 import { CategoryTabs, SearchField } from "../features/feed/Filters";
 import { PillTabs } from "../components/ui/Tabs";
+import { Select } from "../components/ui/Controls";
 import { DayList, Pagination } from "../features/feed/DayList";
 import { EmptyState } from "../components/ui/Page";
 import { RingMark } from "../components/Logo";
@@ -20,12 +21,16 @@ export async function loader({ request }: Route.LoaderArgs) {
   const tag = url.searchParams.get("tag")?.trim() || null;
   const q = url.searchParams.get("q")?.trim().slice(0, 200) || null;
   const tab = url.searchParams.get("tab") === "relevance" ? "relevance" : null;
+  const sort = url.searchParams.get("sort") === "score" ? "score" : null;
   // Legacy deep-paging parameters (deep, anchorAt) still open a normal page.
-  const page = Math.min(Math.max(Number.parseInt(url.searchParams.get("page") ?? "1", 10) || 1, 1), 50);
+  const requested = Number.parseInt(url.searchParams.get("page") ?? "1", 10) || 1;
+  const page = Math.min(Math.max(requested, 1), 50);
   const data = await loadOr404<PoolResponse>(
-    `/api/site/pool${queryString({ channel: channel === "all" ? null : channel, category, tag, q, tab, page: page > 1 ? page : null })}`,
+    `/api/site/pool${queryString({ channel: channel === "all" ? null : channel, category, tag, q, tab, sort, page: page > 1 ? page : null })}`,
     { signal: request.signal, busyRedirect: "/all/search-busy" },
   );
+  // A page past the end is served as the last page; the address follows it.
+  if (data.page !== page || requested > page) throw redirect(pageHref(url.searchParams, data.page));
   return { data };
 }
 
@@ -56,20 +61,40 @@ function pageHref(params: URLSearchParams, page: number) {
   return s ? `/all?${s}` : "/all";
 }
 
+/** Same page in another order: the page number stays (a page past the end falls back to the last). */
+function orderHref(params: URLSearchParams, order: "time" | "relevance" | "score") {
+  const sp = new URLSearchParams(params);
+  sp.delete("tab");
+  sp.delete("sort");
+  if (order === "relevance") sp.set("tab", "relevance");
+  if (order === "score") sp.set("sort", "score");
+  const s = sp.toString();
+  return s ? `/all?${s}` : "/all";
+}
+
+const SEARCH_ORDER_LABELS = { time: "最新（标题与摘要）", relevance: "全文相关", score: "AI 评分" } as const;
+
 export default function AllPage() {
   const { data } = useLoaderData<typeof loader>();
   const [params] = useSearchParams();
+  const navigate = useNavigate();
   const navigation = useNavigation();
   const f = data.filters;
   const busy = navigation.state === "loading" && navigation.location?.pathname === "/all";
-  const keep = { channel: f.channel === "all" ? null : f.channel, category: f.category };
-  const searchTabHref = (tab: "time" | "relevance") => {
-    const sp = new URLSearchParams(params);
-    sp.delete("page");
-    if (tab === "relevance") sp.set("tab", "relevance");
-    else sp.delete("tab");
-    return `/all?${sp}`;
-  };
+  const keep = { channel: f.channel === "all" ? null : f.channel, category: f.category, sort: f.sort === "score" ? "score" : null };
+  const searchTabHref = (order: "time" | "relevance" | "score") => orderHref(params, order);
+  const searchOrder = f.tab === "relevance" ? "relevance" : f.sort;
+  const sortSelect = (
+    <Select
+      value={f.sort}
+      onChange={(e) => navigate(orderHref(params, e.target.value as PoolSort), { preventScrollReset: true })}
+      aria-label="排序"
+      className="shrink-0"
+    >
+      <option value="time">默认</option>
+      <option value="score">AI 评分</option>
+    </Select>
+  );
   const title = f.q ? `搜索“${f.q}”` : f.tag ? `#${f.tag}` : null;
   const updated = new Date(data.freshness).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Shanghai" });
 
@@ -95,8 +120,9 @@ export default function AllPage() {
           )}
         </div>
         <SearchField variant="bar" defaultValue={f.q ?? ""} keep={keep} autoFocus={params.get("search") === "1"} />
-        <div className="-mx-4 mt-3 border-b border-line-soft px-4 pb-3">
-          <CategoryTabs base="/all" category={f.category} channel={f.channel} layoutId="all-cat-mobile" size="sm" className="min-w-0" />
+        <div className="-mx-4 mt-3 flex items-center gap-2 border-b border-line-soft px-4 pb-3">
+          <CategoryTabs base="/all" category={f.category} channel={f.channel} layoutId="all-cat-mobile" size="sm" className="min-w-0 flex-1" />
+          {!f.q && sortSelect}
         </div>
       </div>
 
@@ -106,8 +132,8 @@ export default function AllPage() {
             size="xs"
             layoutId="all-search-sort"
             label="搜索排序"
-            active={f.tab}
-            items={(["time", "relevance"] as const).map((t) => ({ key: t, label: t === "time" ? "最新（标题与摘要）" : "全文相关", to: searchTabHref(t) }))}
+            active={searchOrder}
+            items={(["time", "relevance", "score"] as const).map((t) => ({ key: t, label: SEARCH_ORDER_LABELS[t], to: searchTabHref(t) }))}
           />
           <span className="text-[12px] text-ink-4">
             找到 <span className="num">{data.total >= 2000 ? "2000+" : data.total}</span> 条 · 更新于 <span className="num">{updated}</span>
@@ -132,7 +158,7 @@ export default function AllPage() {
             </EmptyState>
           </div>
         ) : (
-          <DayList items={data.items} todayCount={f.q ? null : data.todayCount} showTags />
+          <DayList items={data.items} todayCount={f.q ? null : data.todayCount} showTags aside={f.q ? undefined : sortSelect} />
         )}
       </div>
       <Pagination page={data.page} pageCount={data.pageCount} href={(p) => pageHref(params, p)} />

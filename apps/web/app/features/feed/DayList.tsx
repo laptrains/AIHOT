@@ -9,7 +9,8 @@ import { markRead, useReadSet } from "../../lib/local-state";
 import { DayHeader, TimelineSlot } from "./Timeline";
 import { FeedItem } from "./FeedItem";
 
-export function DayList({ items, todayCount = null, showTags = true, animate = false }: { items: FeedItemSummary[]; todayCount?: number | null; showTags?: boolean; animate?: boolean }) {
+/** `aside` renders at the right end of the first day header (desktop). */
+export function DayList({ items, todayCount = null, showTags = true, animate = false, aside }: { items: FeedItemSummary[]; todayCount?: number | null; showTags?: boolean; animate?: boolean; aside?: React.ReactNode }) {
   const readSet = useReadSet();
   const today = beijingDate(Date.now());
   const days = useMemo(() => {
@@ -25,9 +26,9 @@ export function DayList({ items, todayCount = null, showTags = true, animate = f
   let order = 0;
   return (
     <div>
-      {days.map(({ day, items: list }) => (
+      {days.map(({ day, items: list }, i) => (
         <section key={day} aria-label={day}>
-          <DayHeader day={day} today={today} count={day === today ? todayCount : null} />
+          <DayHeader day={day} today={today} count={day === today ? todayCount : null} aside={i === 0 ? aside : undefined} />
           <ol className="lg:pt-1">
             {list.map((it) => (
               <TimelineSlot key={it.id} at={it.timelineAt} fresh={animate} delay={animate ? Math.min(order++, 12) * 25 : 0}>

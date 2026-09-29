@@ -120,8 +120,12 @@ export interface TimelineResponse {
   generatedAt: string;
 }
 
+/** 全部动态 order: time (newest first) or score (Beijing day, then AI score high to low). */
+export type PoolSort = "time" | "score";
+
 export interface PoolResponse {
-  filters: TimelineFilters & { q: string | null; tab: "time" | "relevance" };
+  /** `sort` is the order in effect: a relevance search reports "time". */
+  filters: TimelineFilters & { q: string | null; tab: "time" | "relevance"; sort: PoolSort };
   items: FeedItemSummary[];
   page: number;
   pageCount: number;
